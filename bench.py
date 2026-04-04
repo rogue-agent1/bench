@@ -1,152 +1,163 @@
 #!/usr/bin/env python3
-"""bench - HTTP endpoint benchmarker.
+"""bench - Command benchmarking tool.
 
-One file. Zero deps. Load test anything.
-
-Usage:
-  bench.py https://example.com               → 100 requests, 10 concurrent
-  bench.py https://example.com -n 500 -c 20  → 500 reqs, 20 concurrent
-  bench.py https://api.com/data -m POST -d '{"key":"val"}'
-  bench.py https://example.com --json         → JSON output
+Time commands, compare alternatives, statistical analysis. Zero dependencies.
 """
 
 import argparse
-import json
-import statistics
+import math
+import os
+import subprocess
 import sys
-import threading
 import time
-import urllib.request
-import urllib.error
+import json
 
 
-def do_request(url: str, method: str = "GET", data: str = None,
-               headers: dict = None, timeout: int = 10) -> dict:
-    req = urllib.request.Request(url, method=method)
-    if headers:
-        for k, v in headers.items():
-            req.add_header(k, v)
-    body = data.encode() if data else None
-    start = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, body, timeout=timeout) as r:
-            r.read()
-            elapsed = time.monotonic() - start
-            return {"status": r.status, "time": elapsed, "error": None}
-    except urllib.error.HTTPError as e:
-        elapsed = time.monotonic() - start
-        return {"status": e.code, "time": elapsed, "error": None}
-    except Exception as e:
-        elapsed = time.monotonic() - start
-        return {"status": 0, "time": elapsed, "error": str(e)}
+def run_cmd(cmd, shell=True):
+    start = time.perf_counter()
+    r = subprocess.run(cmd, shell=shell, capture_output=True)
+    elapsed = time.perf_counter() - start
+    return {"time": elapsed, "exit": r.returncode, "stdout_len": len(r.stdout), "stderr_len": len(r.stderr)}
 
 
-def run_bench(url: str, n: int, c: int, method: str = "GET",
-              data: str = None, headers: dict = None, timeout: int = 10):
-    results = []
-    lock = threading.Lock()
-    counter = [0]
-
-    def worker():
-        while True:
-            with lock:
-                idx = counter[0]
-                if idx >= n:
-                    return
-                counter[0] += 1
-            r = do_request(url, method, data, headers, timeout)
-            with lock:
-                results.append(r)
-
-    start = time.monotonic()
-    threads = []
-    for _ in range(min(c, n)):
-        t = threading.Thread(target=worker)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-    total_time = time.monotonic() - start
-
-    return results, total_time
-
-
-def print_results(results: list[dict], total_time: float, url: str, as_json: bool = False):
-    times = [r["time"] for r in results if not r["error"]]
-    errors = [r for r in results if r["error"]]
-    statuses = {}
-    for r in results:
-        s = r["status"]
-        statuses[s] = statuses.get(s, 0) + 1
-
-    data = {
-        "url": url,
-        "requests": len(results),
-        "errors": len(errors),
-        "total_time_s": round(total_time, 3),
-        "rps": round(len(results) / total_time, 1) if total_time > 0 else 0,
-        "statuses": statuses,
+def stats(times):
+    n = len(times)
+    avg = sum(times) / n
+    if n > 1:
+        var = sum((t - avg) ** 2 for t in times) / (n - 1)
+        sd = math.sqrt(var)
+    else:
+        sd = 0
+    return {
+        "n": n, "mean": avg, "min": min(times), "max": max(times),
+        "stdev": sd, "median": sorted(times)[n // 2],
+        "total": sum(times),
     }
 
-    if times:
-        data.update({
-            "min_ms": round(min(times) * 1000, 1),
-            "max_ms": round(max(times) * 1000, 1),
-            "mean_ms": round(statistics.mean(times) * 1000, 1),
-            "median_ms": round(statistics.median(times) * 1000, 1),
-            "p95_ms": round(sorted(times)[int(len(times) * 0.95)] * 1000, 1),
-            "p99_ms": round(sorted(times)[int(len(times) * 0.99)] * 1000, 1),
-            "stdev_ms": round(statistics.stdev(times) * 1000, 1) if len(times) > 1 else 0,
-        })
 
-    if as_json:
-        print(json.dumps(data, indent=2))
-        return
+def fmt_time(s):
+    if s < 0.001:
+        return f"{s*1e6:.0f}µs"
+    if s < 1:
+        return f"{s*1000:.1f}ms"
+    return f"{s:.3f}s"
 
-    print(f"\n  URL:        {url}")
-    print(f"  Requests:   {data['requests']} ({data['errors']} errors)")
-    print(f"  Total:      {data['total_time_s']}s")
-    print(f"  RPS:        {data['rps']}")
-    if times:
-        print(f"  Latency:")
-        print(f"    Min:      {data['min_ms']}ms")
-        print(f"    Mean:     {data['mean_ms']}ms")
-        print(f"    Median:   {data['median_ms']}ms")
-        print(f"    P95:      {data['p95_ms']}ms")
-        print(f"    P99:      {data['p99_ms']}ms")
-        print(f"    Max:      {data['max_ms']}ms")
-    if statuses:
-        print(f"  Status codes:")
-        for s, count in sorted(statuses.items()):
-            print(f"    {s}: {count}")
+
+def cmd_run(args):
+    n = args.n or 10
+    warmup = args.warmup or 0
+
+    if warmup:
+        for _ in range(warmup):
+            run_cmd(args.command)
+
+    times = []
+    for i in range(n):
+        r = run_cmd(args.command)
+        times.append(r["time"])
+        if args.verbose:
+            print(f"  Run {i+1}: {fmt_time(r['time'])}")
+
+    s = stats(times)
+    print(f"\n  Command: {args.command}")
+    print(f"  Runs:    {s['n']}")
+    print(f"  Mean:    {fmt_time(s['mean'])} ± {fmt_time(s['stdev'])}")
+    print(f"  Min:     {fmt_time(s['min'])}")
+    print(f"  Max:     {fmt_time(s['max'])}")
+    print(f"  Median:  {fmt_time(s['median'])}")
+    print(f"  Total:   {fmt_time(s['total'])}")
+
+    # Histogram
+    if n >= 5:
+        buckets = 8
+        lo, hi = s["min"], s["max"]
+        if lo == hi:
+            hi = lo + 0.001
+        step = (hi - lo) / buckets
+        hist = [0] * buckets
+        for t in times:
+            idx = min(int((t - lo) / step), buckets - 1)
+            hist[idx] += 1
+        mx = max(hist)
+        print(f"\n  Distribution:")
+        for i, count in enumerate(hist):
+            bar = "█" * (count * 30 // mx) if mx else ""
+            label = fmt_time(lo + i * step)
+            print(f"    {label:>8} │{bar}")
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump({"command": args.command, "times": times, "stats": s}, f, indent=2)
+
+
+def cmd_compare(args):
+    results = []
+    for cmd in args.commands:
+        times = []
+        for _ in range(args.n or 10):
+            r = run_cmd(cmd)
+            times.append(r["time"])
+        s = stats(times)
+        s["command"] = cmd
+        results.append(s)
+
+    results.sort(key=lambda x: x["mean"])
+    baseline = results[0]["mean"]
+
+    print(f"{'Command':<35} {'Mean':>10} {'±Stdev':>10} {'Min':>10} {'vs best':>10}")
+    print("-" * 80)
+    for r in results:
+        ratio = r["mean"] / baseline if baseline else 0
+        marker = " ⚡" if ratio == 1.0 else ""
+        print(f"{r['command'][:34]:<35} {fmt_time(r['mean']):>10} {fmt_time(r['stdev']):>10} "
+              f"{fmt_time(r['min']):>10} {ratio:>9.2f}x{marker}")
+
+
+def cmd_profile(args):
+    """Profile command over increasing input sizes."""
+    sizes = [int(s) for s in args.sizes.split(",")]
+    print(f"{'Size':>8} {'Time':>10} {'Rate':>12}")
+    print("-" * 35)
+    prev_time = None
+    for size in sizes:
+        cmd = args.command.replace("{N}", str(size))
+        times = [run_cmd(cmd)["time"] for _ in range(args.n or 3)]
+        avg = sum(times) / len(times)
+        rate = size / avg if avg > 0 else 0
+        growth = ""
+        if prev_time and prev_time > 0:
+            ratio = avg / prev_time
+            growth = f"  ({ratio:.1f}x)"
+        print(f"{size:>8} {fmt_time(avg):>10} {rate:>10.0f}/s{growth}")
+        prev_time = avg
 
 
 def main():
-    p = argparse.ArgumentParser(description="HTTP endpoint benchmarker")
-    p.add_argument("url")
-    p.add_argument("-n", "--requests", type=int, default=100)
-    p.add_argument("-c", "--concurrency", type=int, default=10)
-    p.add_argument("-m", "--method", default="GET")
-    p.add_argument("-d", "--data")
-    p.add_argument("-H", "--header", action="append", default=[])
-    p.add_argument("-t", "--timeout", type=int, default=10)
-    p.add_argument("--json", action="store_true")
+    p = argparse.ArgumentParser(description="Command benchmarking tool")
+    sub = p.add_subparsers(dest="cmd")
+
+    rp = sub.add_parser("run", help="Benchmark a command")
+    rp.add_argument("command")
+    rp.add_argument("-n", type=int, default=10)
+    rp.add_argument("-w", "--warmup", type=int, default=0)
+    rp.add_argument("-v", "--verbose", action="store_true")
+    rp.add_argument("-o", "--json-output")
+
+    cp = sub.add_parser("compare", help="Compare multiple commands")
+    cp.add_argument("commands", nargs="+")
+    cp.add_argument("-n", type=int, default=10)
+
+    pp = sub.add_parser("profile", help="Profile with scaling input")
+    pp.add_argument("command", help="Command with {N} placeholder")
+    pp.add_argument("sizes", help="Comma-separated sizes")
+    pp.add_argument("-n", type=int, default=3)
+
     args = p.parse_args()
-
-    headers = {}
-    for h in args.header:
-        if ":" in h:
-            k, v = h.split(":", 1)
-            headers[k.strip()] = v.strip()
-
-    if not args.json:
-        print(f"Benchmarking {args.url} ({args.requests} requests, {args.concurrency} concurrent)...")
-
-    results, total = run_bench(args.url, args.requests, args.concurrency,
-                                args.method, args.data, headers, args.timeout)
-    print_results(results, total, args.url, args.json)
-    return 0
+    if not args.cmd:
+        p.print_help()
+        sys.exit(1)
+    {"run": cmd_run, "compare": cmd_compare, "profile": cmd_profile}[args.cmd](args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
